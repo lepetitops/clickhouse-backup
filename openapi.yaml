@@ -1,0 +1,1361 @@
+openapi: 3.0.3
+info:
+  title: ClickHouse Backup API
+  version: 2.x.x
+  description: >
+    REST API for ClickHouse Backup utility. Provides endpoints for managing backups,
+    including creation, upload, download, restore, and cleanup operations.
+    
+    All operations except /health and /metrics require authentication.
+    
+    This API supports asynchronous operations with callback notifications.
+servers:
+  - url: http://localhost:7171
+    description: Default development server
+  - url: https://api.example.com
+    description: Production server (HTTPS)
+tags:
+  - name: System
+    description: System health and version information
+  - name: Backup Operations
+    description: Core backup operations (create, upload, download, restore)
+  - name: Backup Management
+    description: Backup listing, deletion, and cleanup
+  - name: Tables
+    description: Database table information
+  - name: Status
+    description: Operation status and monitoring
+  - name: Actions
+    description: Action logging and execution
+  - name: Server Control
+    description: Server restart and kill operations
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: HTTP Basic Authentication using username and password from API config
+    queryAuth:
+      type: apiKey
+      in: query
+      name: user
+      description: Alternative authentication via query parameters (user and pass)
+  schemas:
+    Error:
+      type: object
+      required: [status, error]
+      properties:
+        status:
+          type: string
+          enum: [error]
+        operation:
+          type: string
+          description: The operation that failed
+        error:
+          type: string
+          description: Error message
+      example:
+        status: error
+        operation: create
+        error: another operation is currently running
+    
+    OperationResponse:
+      type: object
+      required: [status, operation, operation_id]
+      properties:
+        status:
+          type: string
+          enum: [acknowledged]
+        operation:
+          type: string
+          description: The operation being performed
+        backup_name:
+          type: string
+          description: Name of the backup (for backup operations)
+        operation_id:
+          type: string
+          format: uuid
+          description: Unique identifier for tracking the operation
+      example:
+        status: acknowledged
+        operation: create
+        backup_name: backup_20240101_120000
+        operation_id: 123e4567-e89b-12d3-a456-426614174000
+    
+    BackupListItem:
+      type: object
+      required: [name, created, metadata_size, location, required, desc]
+      properties:
+        name:
+          type: string
+          description: Backup name
+        created:
+          type: string
+          format: date-time
+          description: Backup creation timestamp
+        size:
+          type: integer
+          minimum: 0
+          description: Total backup size in bytes
+        data_size:
+          type: integer
+          minimum: 0
+          description: Data size in bytes
+        object_disk_size:
+          type: integer
+          minimum: 0
+          description: Object disk size in bytes
+        metadata_size:
+          type: integer
+          minimum: 0
+          description: Metadata size in bytes
+        rbac_size:
+          type: integer
+          minimum: 0
+          description: RBAC data size in bytes
+        config_size:
+          type: integer
+          minimum: 0
+          description: Config size in bytes
+        compressed_size:
+          type: integer
+          minimum: 0
+          description: Compressed size in bytes (for remote backups)
+        location:
+          type: string
+          enum: [local, remote]
+          description: Backup location
+        required:
+          type: string
+          description: Required backup dependency
+        desc:
+          type: string
+          description: Backup description and format info
+      example:
+        name: backup_20240101_120000
+        created: "2024-01-01 12:00:00"
+        size: 1048576
+        data_size: 1000000
+        metadata_size: 48576
+        location: local
+        required: ""
+        desc: "regular"
+    
+    Table:
+      type: object
+      required: [database, name, engine]
+      properties:
+        database:
+          type: string
+          description: Database name
+        name:
+          type: string
+          description: Table name
+        engine:
+          type: string
+          description: Table engine
+        is_temporary:
+          type: boolean
+          description: Whether table is temporary
+        dependencies:
+          type: array
+          items:
+            type: string
+          description: Table dependencies
+        skip_reason:
+          type: string
+          description: Reason why table was skipped (if applicable)
+      example:
+        database: default
+        name: users
+        engine: MergeTree
+        is_temporary: false
+        dependencies: []
+    
+    ActionStatus:
+      type: object
+      required: [command, status]
+      properties:
+        command:
+          type: string
+          description: The command that was executed
+        status:
+          type: string
+          enum: [in progress, success, error, cancel]
+          description: Current status of the operation
+        start:
+          type: string
+          format: date-time
+          description: Operation start time
+        finish:
+          type: string
+          format: date-time
+          description: Operation finish time (if completed)
+        error:
+          type: string
+          description: Error message (if status is error)
+      example:
+        command: "create backup_20240101_120000"
+        status: success
+        start: "2024-01-01 12:00:00"
+        finish: "2024-01-01 12:05:00"
+    
+    VersionInfo:
+      type: object
+      required: [version, git_commit, build_date]
+      properties:
+        version:
+          type: string
+          description: Application version
+        git_commit:
+          type: string
+          description: Git commit hash
+        build_date:
+          type: string
+          description: Build timestamp
+      example:
+        version: v2.4.25
+        git_commit: abc1234567890
+        build_date: "2024-01-01T12:00:00Z"
+    
+    CallbackResponse:
+      type: object
+      required: [status, operation_id]
+      properties:
+        status:
+          type: string
+          enum: [success, error]
+          description: Final operation status
+        error:
+          type: string
+          description: Error message (if status is error)
+        operation_id:
+          type: string
+          format: uuid
+          description: Operation identifier matching the original request
+
+security:
+  - basicAuth: []
+
+paths:
+  /:
+    get:
+      summary: Get API root information
+      tags: [System]
+      responses:
+        '200':
+          description: API information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    post:
+      summary: Restart server
+      tags: [Server Control]
+      responses:
+        '200':
+          description: Restart acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /restart:
+    post:
+      summary: Restart server
+      tags: [Server Control]
+      responses:
+        '200':
+          description: Restart acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: Restart server (alternative method)
+      tags: [Server Control]
+      responses:
+        '200':
+          description: Restart acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    get:
+      summary: Health check endpoint
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+              examples:
+                healthy:
+                  value:
+                    status: ok
+
+  /backup/version:
+    get:
+      summary: Get application version
+      tags: [System]
+      responses:
+        '200':
+          description: Version information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionInfo'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/kill:
+    post:
+      summary: Kill running operations
+      tags: [Server Control]
+      responses:
+        '200':
+          description: Kill operation acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: Kill running operations (alternative method)
+      tags: [Server Control]
+      responses:
+        '200':
+          description: Kill operation acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/tables:
+    get:
+      summary: List database tables
+      tags: [Tables]
+      parameters:
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter (glob pattern)
+        - in: query
+          name: remote_backup
+          schema:
+            type: string
+          description: Remote backup name to list tables from
+      responses:
+        '200':
+          description: Filtered list of tables
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Table'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/tables/all:
+    get:
+      summary: List all database tables
+      tags: [Tables]
+      parameters:
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter (glob pattern)
+        - in: query
+          name: remote_backup
+          schema:
+            type: string
+          description: Remote backup name to list tables from
+      responses:
+        '200':
+          description: Complete list of all tables
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Table'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/list:
+    get:
+      summary: List all backups (local and remote)
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: List of all backups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BackupListItem'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    head:
+      summary: Check backup list endpoint
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Endpoint is available
+        '401':
+          description: Unauthorized
+
+  /backup/list/{where}:
+    parameters:
+      - in: path
+        name: where
+        required: true
+        schema:
+          type: string
+          enum: [local, remote]
+        description: Backup location filter
+    get:
+      summary: List backups by location
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Filtered list of backups
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BackupListItem'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/create:
+    post:
+      summary: Create a new backup
+      description: >
+        Create a new backup asynchronously. The operation returns immediately with an
+        operation ID that can be used to track progress.
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter (works like --table CLI argument)
+          example: "default.users*"
+        - in: query
+          name: name
+          schema:
+            type: string
+          description: Custom backup name (auto-generated if not provided)
+          example: "my_backup_20240101"
+        - in: query
+          name: partitions
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Specific partitions to backup
+        - in: query
+          name: diff-from-remote
+          schema:
+            type: string
+          description: Create incremental backup from specified remote backup
+        - in: query
+          name: diff_from_remote
+          schema:
+            type: string
+          description: Create incremental backup from specified remote backup (alternative parameter name)
+        - in: query
+          name: schema
+          schema:
+            type: boolean
+          description: Backup schema only (works like --schema CLI argument)
+        - in: query
+          name: rbac
+          schema:
+            type: boolean
+          description: Include RBAC (works like --rbac CLI argument)
+        - in: query
+          name: rbac-only
+          schema:
+            type: boolean
+          description: Backup RBAC only (works like --rbac-only CLI argument)
+        - in: query
+          name: rbac_only
+          schema:
+            type: boolean
+          description: Backup RBAC only (alternative parameter name)
+        - in: query
+          name: configs
+          schema:
+            type: boolean
+          description: Include configs (works like --configs CLI argument)
+        - in: query
+          name: configs-only
+          schema:
+            type: boolean
+          description: Backup configs only (works like --configs-only CLI argument)
+        - in: query
+          name: configs_only
+          schema:
+            type: boolean
+          description: Backup configs only (alternative parameter name)
+        - in: query
+          name: skip-check-parts-columns
+          schema:
+            type: boolean
+          description: Skip parts columns check (works like --skip-check-parts-columns CLI argument)
+        - in: query
+          name: skip_check_parts_columns
+          schema:
+            type: boolean
+          description: Skip parts columns check (alternative parameter name)
+        - in: query
+          name: skip-projections
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Skip specified projections
+        - in: query
+          name: resume
+          schema:
+            type: boolean
+          description: Resume interrupted backup (works like --resume CLI argument)
+        - in: query
+          name: callback
+          schema:
+            type: string
+            format: uri
+          description: >
+            Callback URL for async notifications. Will receive POST with 
+            JSON payload containing operation status and ID.
+      responses:
+        '201':
+          description: Backup creation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/upload/{name}:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        description: Backup name to upload
+    post:
+      summary: Upload backup to remote storage
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: diff-from
+          schema:
+            type: string
+          description: Create differential upload from specified backup
+        - in: query
+          name: diff_from
+          schema:
+            type: string
+          description: Create differential upload from specified backup (alternative parameter name)
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter
+        - in: query
+          name: partitions
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Specific partitions to upload
+        - in: query
+          name: schema
+          schema:
+            type: boolean
+          description: Upload schema only
+        - in: query
+          name: rbac-only
+          schema:
+            type: boolean
+          description: Upload RBAC only
+        - in: query
+          name: configs-only
+          schema:
+            type: boolean
+          description: Upload configs only
+        - in: query
+          name: skip-projections
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Skip specified projections
+        - in: query
+          name: resumable
+          schema:
+            type: boolean
+          description: Enable resumable upload
+        - in: query
+          name: resume
+          schema:
+            type: boolean
+          description: Resume interrupted upload
+        - in: query
+          name: delete-source
+          schema:
+            type: boolean
+          description: Delete source files after upload
+        - in: query
+          name: callback
+          schema:
+            type: string
+            format: uri
+          description: Callback URL for async notifications
+      responses:
+        '201':
+          description: Upload started
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OperationResponse'
+                  - type: object
+                    properties:
+                      backup_from:
+                        type: string
+                        description: Base backup for differential upload
+                      diff:
+                        type: boolean
+                        description: Whether this is a differential upload
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/download/{name}:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        description: Backup name to download
+    post:
+      summary: Download backup from remote storage
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter
+        - in: query
+          name: partitions
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Specific partitions to download
+        - in: query
+          name: schema
+          schema:
+            type: boolean
+          description: Download schema only
+        - in: query
+          name: rbac-only
+          schema:
+            type: boolean
+          description: Download RBAC only
+        - in: query
+          name: configs-only
+          schema:
+            type: boolean
+          description: Download configs only
+        - in: query
+          name: resume
+          schema:
+            type: boolean
+          description: Resume interrupted download
+        - in: query
+          name: callback
+          schema:
+            type: string
+            format: uri
+          description: Callback URL for async notifications
+      responses:
+        '201':
+          description: Download started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/restore/{name}:
+    parameters:
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        description: Backup name to restore
+    post:
+      summary: Restore backup
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter
+        - in: query
+          name: partitions
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Specific partitions to restore
+        - in: query
+          name: schema
+          schema:
+            type: boolean
+          description: Restore schema only
+        - in: query
+          name: data
+          schema:
+            type: boolean
+          description: Restore data only
+        - in: query
+          name: rbac
+          schema:
+            type: boolean
+          description: Restore RBAC
+        - in: query
+          name: rbac-only
+          schema:
+            type: boolean
+          description: Restore RBAC only
+        - in: query
+          name: configs
+          schema:
+            type: boolean
+          description: Restore configs
+        - in: query
+          name: configs-only
+          schema:
+            type: boolean
+          description: Restore configs only
+        - in: query
+          name: restore-database-mapping
+          schema:
+            type: string
+          description: Database mapping for restore (format "old:new,old2:new2")
+        - in: query
+          name: restore_database_mapping
+          schema:
+            type: string
+          description: Database mapping for restore (alternative parameter name)
+        - in: query
+          name: restore-table-mapping
+          schema:
+            type: string
+          description: Table mapping for restore (format "old:new,old2:new2")
+        - in: query
+          name: restore_table_mapping
+          schema:
+            type: string
+          description: Table mapping for restore (alternative parameter name)
+        - in: query
+          name: drop
+          schema:
+            type: boolean
+          description: Drop existing tables before restore
+        - in: query
+          name: ignore-dependencies
+          schema:
+            type: boolean
+          description: Ignore table dependencies during restore
+        - in: query
+          name: ignore_dependencies
+          schema:
+            type: boolean
+          description: Ignore table dependencies during restore (alternative parameter name)
+        - in: query
+          name: skip-projections
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Skip specified projections
+        - in: query
+          name: resume
+          schema:
+            type: boolean
+          description: Resume interrupted restore
+        - in: query
+          name: callback
+          schema:
+            type: string
+            format: uri
+          description: Callback URL for async notifications
+      responses:
+        '201':
+          description: Restore started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/delete/{where}/{name}:
+    parameters:
+      - in: path
+        name: where
+        required: true
+        schema:
+          type: string
+          enum: [local, remote]
+        description: Location of backup to delete
+      - in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        description: Backup name to delete
+    post:
+      summary: Delete backup
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Delete operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/clean:
+    post:
+      summary: Clean old backups
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Clean operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/clean/remote_broken:
+    post:
+      summary: Clean broken remote backups
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Clean operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/clean/local_broken:
+    post:
+      summary: Clean broken local backups
+      tags: [Backup Management]
+      responses:
+        '200':
+          description: Clean operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/watch:
+    post:
+      summary: Start watch operation
+      description: >
+        Start a watch operation that continuously monitors and creates backups
+        based on specified intervals.
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: watch_interval
+          schema:
+            type: string
+          description: Watch interval (e.g., "1h", "30m")
+        - in: query
+          name: full_interval
+          schema:
+            type: string
+          description: Full backup interval (e.g., "24h")
+        - in: query
+          name: table
+          schema:
+            type: string
+          description: Table pattern filter
+        - in: query
+          name: partitions
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: true
+          description: Specific partitions to watch
+        - in: query
+          name: schema
+          schema:
+            type: boolean
+          description: Watch schema only
+        - in: query
+          name: rbac
+          schema:
+            type: boolean
+          description: Include RBAC in watch
+        - in: query
+          name: configs
+          schema:
+            type: boolean
+          description: Include configs in watch
+        - in: query
+          name: skip-check-parts-columns
+          schema:
+            type: boolean
+          description: Skip parts columns check
+        - in: query
+          name: skip_check_parts_columns
+          schema:
+            type: boolean
+          description: Skip parts columns check (alternative parameter name)
+        - in: query
+          name: delete-source
+          schema:
+            type: boolean
+          description: Delete source files during upload
+        - in: query
+          name: delete_source
+          schema:
+            type: boolean
+          description: Delete source files during upload (alternative parameter name)
+      responses:
+        '201':
+          description: Watch operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '423':
+          description: Locked - another operation is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      summary: Start watch operation (alternative method)
+      tags: [Backup Operations]
+      parameters:
+        - in: query
+          name: watch_interval
+          schema:
+            type: string
+          description: Watch interval (e.g., "1h", "30m")
+        - in: query
+          name: full_interval
+          schema:
+            type: string
+          description: Full backup interval (e.g., "24h")
+      responses:
+        '201':
+          description: Watch operation started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OperationResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/status:
+    get:
+      summary: Get current operation status
+      tags: [Status]
+      responses:
+        '200':
+          description: Current operation status
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ActionStatus'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /backup/actions:
+    get:
+      summary: Get actions log
+      tags: [Actions]
+      responses:
+        '200':
+          description: Actions log
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ActionStatus'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    head:
+      summary: Check actions endpoint
+      tags: [Actions]
+      responses:
+        '200':
+          description: Endpoint is available
+        '401':
+          description: Unauthorized
+    post:
+      summary: Execute action
+      description: >
+        Execute actions via JSON payload. Used for integration with ClickHouse
+        system tables like system.backup_actions.
+      tags: [Actions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  description: Command to execute
+              example:
+                command: "create backup_name"
+      responses:
+        '200':
+          description: Action executed successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    status:
+                      type: string
+                    operation:
+                      type: string
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      tags: [System]
+      description: Prometheus-formatted metrics for monitoring
+      security: []
+      responses:
+        '200':
+          description: Metrics in Prometheus format
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: |
+                  # HELP clickhouse_backup_last_backup_size_local Last local backup size
+                  # TYPE clickhouse_backup_last_backup_size_local gauge
+                  clickhouse_backup_last_backup_size_local 1048576
+
+  /debug/pprof/:
+    get:
+      summary: Go pprof debug index
+      tags: [System]
+      description: Go profiling debug interface (enabled when pprof is enabled)
+      responses:
+        '200':
+          description: Pprof index page
+          content:
+            text/html:
+              schema:
+                type: string
+        '401':
+          description: Unauthorized
+
+  /debug/pprof/profile:
+    get:
+      summary: CPU profile
+      tags: [System]
+      description: CPU profiling data (enabled when pprof is enabled)
+      responses:
+        '200':
+          description: CPU profile data
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized
